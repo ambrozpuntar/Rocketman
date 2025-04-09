@@ -19,6 +19,7 @@ public class RocketWorkerService : IHostedService
     private readonly ILogger<RocketWorkerService> _logger;
     private readonly IServiceProvider _serviceProvider;
     private readonly List<string> _recipents;
+    private bool _stopping = false;
 
     public RocketWorkerService(
         IOptions<RocketWorkerSettings> settings,
@@ -38,7 +39,8 @@ public class RocketWorkerService : IHostedService
         if (!_settings.SyncEnabled)
             await StopAsync(cancellationToken).ConfigureAwait(false);
 
-        
+        _stopping = false;
+
         using (var scope = _serviceProvider.CreateScope())
         {
             var dbContext = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
@@ -54,76 +56,87 @@ public class RocketWorkerService : IHostedService
     {
         var interval = TimeSpan.FromDays(_settings.IntervalDays);
 
-        try
+        while (!_stopping)
         {
-            var scope = _serviceProvider.CreateScope();
-
-            //var dbContext = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
-            var rocketApiService = scope.ServiceProvider.GetRequiredService<IRocketApiService>();
-            var emailSender = scope.ServiceProvider.GetRequiredService<IEmailSender>();
-            var sqliteService = scope.ServiceProvider.GetRequiredService<ISqliteService>();
-
-            //Get launches
-            var launches = await rocketApiService.GetLaunchesAsync();
-
-            foreach(var launch in launches)
+            try
             {
-                if (string.IsNullOrWhiteSpace(launch.Id))
-                    continue;
-                var result = await sqliteService.GetLaunchByIdAsync(launch.Id);
+                using var scope = _serviceProvider.CreateScope();
 
-                //If launch exists and statuses are the same, skip
-                if(result is not null && result.Status == launch.Status)
-                {
-                    continue;
-                }
-                else if(result is not null && result.Status != launch.Status)
-                {
-                    result.NotifiedStatus = Enums.NotifiedStatus.NotNotified;
-                    result.LaunchDate = launch.LaunchDate;
-                    result.Status = launch.Status;
+                //var dbContext = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+                var rocketApiService = scope.ServiceProvider.GetRequiredService<IRocketApiService>();
+                var emailSender = scope.ServiceProvider.GetRequiredService<IEmailSender>();
+                var sqliteService = scope.ServiceProvider.GetRequiredService<ISqliteService>();
 
-                    var isUpdated = await sqliteService.UpdateLaunchAsync(result);
+                if (ct.IsCancellationRequested)
+                {
+                    _stopping = true;
+                    ct.ThrowIfCancellationRequested();
                 }
 
-                //If launch doesnt exist, add to database
-                if (result is null)
+                //Get launches
+                var launches = await rocketApiService.GetLaunchesAsync();
+
+                foreach (var launch in launches)
                 {
-                    var toLaunch = launch.ToLaunch();
-                    toLaunch.NotifiedStatus = Enums.NotifiedStatus.NotNotified;
-                    await sqliteService.AddLaunchAsync(toLaunch);
-                    continue;
+                    if (string.IsNullOrWhiteSpace(launch.Id))
+                        continue;
+                    var result = await sqliteService.GetLaunchByIdAsync(launch.Id);
+
+                    //If launch exists and statuses are the same, skip
+                    if (result is not null && result.Status == launch.Status)
+                    {
+                        continue;
+                    }
+                    else if (result is not null && result.Status != launch.Status)
+                    {
+                        result.NotifiedStatus = Enums.NotifiedStatus.NotNotified;
+                        result.LaunchDate = launch.LaunchDate;
+                        result.Status = launch.Status;
+
+                        var isUpdated = await sqliteService.UpdateLaunchAsync(result);
+                    }
+
+                    //If launch doesnt exist, add to database
+                    if (result is null)
+                    {
+                        var toLaunch = launch.ToLaunch();
+                        toLaunch.NotifiedStatus = Enums.NotifiedStatus.NotNotified;
+                        await sqliteService.AddLaunchAsync(toLaunch);
+                        continue;
+                    }
+                }
+
+                var unotifiedLaunches = await sqliteService.GetUnnotifiedLaunchesAsync();
+                if (unotifiedLaunches.Count > 0)
+                {
+                    var emailBody = new StringBuilder();
+                    emailBody.AppendLine("<html><body>");
+                    foreach (var launch in unotifiedLaunches)
+                    {
+                        emailBody.AppendLine($"<p>Launch: {launch.Id} - {launch.LaunchDate} - {launch.Status}<p></br>");
+                    }
+
+                    emailBody.AppendLine("</body></html>");
+
+                    foreach (var recipent in _recipents)
+                    {
+                        await emailSender.SendEmailAsync(recipent, "Rocket Launches", emailBody.ToString());
+                    }
+
+                    foreach (var launch in unotifiedLaunches)
+                    {
+                        launch.NotifiedStatus = Enums.NotifiedStatus.Notified;
+                        await sqliteService.UpdateLaunchAsync(launch);
+                    }
                 }
             }
-
-            var unotifiedLaunches = await sqliteService.GetUnnotifiedLaunchesAsync();
-            if(unotifiedLaunches.Count > 0)
+            catch (Exception ex)
             {
-                var emailBody = new StringBuilder();
-                emailBody.AppendLine("<html><body>");
-                foreach (var launch in unotifiedLaunches)
-                {
-                    emailBody.AppendLine($"<p>Launch: {launch.Id} - {launch.LaunchDate} - {launch.Status}<p></br>");
-                }
-                emailBody.AppendLine("</body></html>");
-
-                foreach(var recipent in _recipents)
-                {
-                    await emailSender.SendEmailAsync(recipent, "Rocket Launches", emailBody.ToString());
-                }
-
-                foreach (var launch in unotifiedLaunches)
-                {
-                    launch.NotifiedStatus = Enums.NotifiedStatus.Notified;
-                    await sqliteService.UpdateLaunchAsync(launch);
-                }
+                _logger.LogError(ex.Message);
             }
+            
+            await Task.Delay(interval, ct).ConfigureAwait(false);
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex.Message);
-        }
-        await Task.Delay(interval, ct).ConfigureAwait(false);
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
