@@ -365,3 +365,4 @@ FodyWeavers.xsd
 appsettings*.json
 
 *.db
+rocketer.db*
